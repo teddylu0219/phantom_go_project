@@ -21,9 +21,20 @@ struct MoveInfo {
     std::vector<int> captured_stones;
 };
 
+struct MoveEvent {
+    Player mover;
+    int pos;
+    std::vector<int> captured_stones;
+};
+
 struct SeqState {
     std::vector<GoAction> seq;
     GoHashKey hash;
+};
+
+struct InfoSetsAtMove {
+    std::vector<SeqState> black;
+    std::vector<SeqState> white;
 };
 
 struct InfoSetSizesRow {
@@ -32,8 +43,7 @@ struct InfoSetSizesRow {
     size_t white_size;
 };
 
-
-// Create GoEnv from the sequence
+// Create GoEnv from a GoAction sequence
 bool rebuildEnvFromSeq(int board_size, const std::vector<GoAction>& seq, GoEnv& env) {
     env = GoEnv(board_size);
     for (const auto& a : seq) {
@@ -46,225 +56,339 @@ bool sameStones(const GoEnv& a, const GoEnv& b) {
     return a.getHashKey() == b.getHashKey();
 }
 
-void pruneSeqSet(std::vector<SeqState>& S, size_t max_size) {
-    if (S.size() <= max_size) return;
-    static std::mt19937 rng{std::random_device{}()};
-    std::shuffle(S.begin(), S.end(), rng);
-    S.resize(max_size);
-}
-
-MoveInfo analyzeMove(
-    const GoEnv& before, 
-    const GoEnv& after, 
-    const GoAction& action) 
-{
+// Analyze a single move's effects
+MoveInfo analyzeMove(const GoEnv& before, const GoEnv& after, const GoAction& action) {
     MoveInfo info;
     info.legal = true;
-    
+
     Player opponent = (action.getPlayer() == Player::kPlayer1) ? Player::kPlayer2 : Player::kPlayer1;
     const auto& old_stones = before.getStoneBitboard();
     const auto& new_stones = after.getStoneBitboard();
-    
+
     GoBitboard removed = old_stones.get(opponent) & ~new_stones.get(opponent);
     while (!removed.none()) {
         int pos = removed._Find_first();
         removed.reset(pos);
         info.captured_stones.push_back(pos);
     }
-    
     return info;
 }
 
-
-bool matchesMoveInfo(
-    const MoveInfo& actual, 
-    const MoveInfo& expected) 
+// Build MoveEvent from referee history
+std::vector<MoveEvent> buildMoveEvents(
+    const std::vector<GoEnv>& referee_history,
+    const std::vector<GoAction>& referee_actions)
 {
-    if (actual.legal != expected.legal) {
-        return false;
-    }
+    std::vector<MoveEvent> events;
+    events.reserve(referee_actions.size());
 
-    if (actual.captured_stones.size() != expected.captured_stones.size()) return false;
-    
-    std::vector<int> actual_sorted_caps = actual.captured_stones;
-    std::vector<int> expected_sorted_caps = expected.captured_stones;
-    std::sort(actual_sorted_caps.begin(), actual_sorted_caps.end());
-    std::sort(expected_sorted_caps.begin(), expected_sorted_caps.end());
-    if (actual_sorted_caps != expected_sorted_caps) return false;
-
-    return true;
-}
-
-std::vector<SeqState> findMatchingNextSeqs(
-    const std::vector<GoAction>& current_seq,
-    const MoveInfo& referee_info,
-    Player moving_player,
-    int board_size)
-{
-    std::vector<SeqState> out;
-    GoEnv current_board(board_size);
-    if (!rebuildEnvFromSeq(board_size, current_seq, current_board)) return out;
-
-    // try every possible positions
-    for (int pos = 0; pos < board_size * board_size; ++pos) {
-        GoEnv test_board = current_board;
-        GoAction guess_action(pos, moving_player);
-        if (test_board.act(guess_action)) {
-            MoveInfo guess_info = analyzeMove(current_board, test_board, guess_action);
-            if (matchesMoveInfo(guess_info, referee_info)) {
-                SeqState s;
-                s.seq = current_seq;
-                s.seq.push_back(guess_action);
-                s.hash = test_board.getHashKey();
-                out.push_back(std::move(s));
-            }
-        }
-    }
-
-    // Consider PASS
-    {
-        GoEnv test_board = current_board;
-        GoAction pass_action(board_size * board_size, moving_player);
-        if (test_board.act(pass_action)) {
-            MoveInfo pass_info = analyzeMove(current_board, test_board, pass_action);
-            if (matchesMoveInfo(pass_info, referee_info)) {
-                SeqState s;
-                s.seq = current_seq;
-                s.seq.push_back(pass_action);
-                s.hash = test_board.getHashKey();
-                out.push_back(std::move(s));
-            }
-        }
-    }
-    return out;
-}
-
-std::vector<SeqState> generateInfoSet(
-    const std::vector<SeqState>& previous_info_set,
-    const GoEnv& referee_board_before,
-    const GoAction& referee_action)
-{
-    GoEnv referee_board_after = referee_board_before;
-    if (!referee_board_after.act(referee_action)) {
-        std::cerr << "CRITICAL ERROR in generateInfoSet: Real action illegal.\n";
-        return {};
-    }
-    MoveInfo true_referee_info = analyzeMove(referee_board_before, referee_board_after, referee_action);
-    Player moving_player = referee_action.getPlayer();
-    int board_size = referee_board_before.getBoardSize();
-
-    std::vector<SeqState> new_info_set;
-    new_info_set.reserve(previous_info_set.size() << 2);
-    std::unordered_set<GoHashKey> seen;
-
-    for (const auto& cand : previous_info_set) {
-        auto nexts = findMatchingNextSeqs(cand.seq, true_referee_info, moving_player, board_size);
-        for (auto& s : nexts) {
-            if (seen.insert(s.hash).second) new_info_set.emplace_back(std::move(s));
-        }
-    }
-    return new_info_set;
-}
-
-std::vector<SeqState> updateInfoSetForActor(
-    const std::vector<SeqState>& previous_info_set,
-    const MoveInfo& expected_info,
-    const GoAction& actor_action,
-    int board_size)
-{
-    std::vector<SeqState> out;
-    out.reserve(previous_info_set.size());
-    std::unordered_set<GoHashKey> seen;
-
-    for (const auto& cand : previous_info_set) {
-        GoEnv before(board_size);
-        if (!rebuildEnvFromSeq(board_size, cand.seq, before)) continue;
-
+    for (size_t k = 0; k < referee_actions.size(); ++k) {
+        const GoEnv& before = referee_history[k];
         GoEnv after = before;
-        if (!after.act(actor_action)) continue;
-
-        MoveInfo mi = analyzeMove(before, after, actor_action);
-
-        if (!matchesMoveInfo(mi, expected_info)) continue;
-
-        SeqState s;
-        s.seq  = cand.seq;
-        s.seq.push_back(actor_action);
-        s.hash = after.getHashKey();
-
-        if (seen.insert(s.hash).second) out.emplace_back(std::move(s));
+        const GoAction& a = referee_actions[k];
+        bool ok = after.act(a);
+        if (!ok) {
+            std::cerr << "CRITICAL: real action illegal at move " << (k+1) << "\n";
+            continue;
+        }
+        MoveInfo info = analyzeMove(before, after, a);
+        MoveEvent ev{ a.getPlayer(), a.getActionID(), std::move(info.captured_stones) };
+        events.push_back(std::move(ev));
     }
-    return out;
+    return events;
+}
+
+std::pair<std::unordered_set<int>, std::unordered_set<int>> computeMustSets(
+    int move_number,
+    Player perspective, // who knows their own stones
+    const std::vector<MoveEvent>& events,
+    const std::vector<GoEnv>& referee_history)
+{
+    const int N = referee_history[0].getBoardSize();
+    const int PASS = N * N;
+    auto other = [](Player p){ return (p == Player::kPlayer1) ? Player::kPlayer2 : Player::kPlayer1; };
+
+    const Player MY  = perspective;
+    const Player OPP = other(MY);
+
+    std::unordered_set<int> must_my, must_opp;
+
+    for (int i = 0; i < move_number; ++i) {
+        const auto& ev = events[i];
+        const GoEnv& before = referee_history[i];
+        const GoEnv& after  = referee_history[i + 1];
+
+        if (ev.mover == MY) {
+            // my move
+            if (ev.pos != PASS) must_my.insert(ev.pos);
+            // capture opponent stones
+            for (int c : ev.captured_stones) {
+                must_opp.erase(c);
+            }
+        } else { // OPP
+            // opponent captureed my stones
+            if (!ev.captured_stones.empty()) {
+                // this move
+                if (ev.pos != PASS) {
+                    must_opp.insert(ev.pos);
+                }
+                // neighbors of captured stones
+                for (int s : ev.captured_stones) {
+                    for (int nb : before.getGrid(s).getNeighbors()) {
+                        if (before.getGrid(nb).getPlayer() == OPP) must_opp.insert(nb);
+                    }
+                }
+            }
+            // remove captured stones
+            for (int c : ev.captured_stones) {
+                must_my.erase(c);
+            }
+        }
+    }
+
+    std::unordered_set<int> must_black, must_white;
+    if (MY == Player::kPlayer1) {
+        must_black = std::move(must_my);
+        must_white = std::move(must_opp);
+    } else {
+        must_white = std::move(must_my);
+        must_black = std::move(must_opp);
+    }
+    return {std::move(must_black), std::move(must_white)};
 }
 
 
+// Do not allow capturing already-satisfied MUST stones
+bool breaksSatisfiedMust(
+    const GoEnv& before, const GoEnv& after, const GoAction& a,
+    const std::unordered_set<int>& satisfied_black,
+    const std::unordered_set<int>& satisfied_white)
+{
+    MoveInfo info = analyzeMove(before, after, a);
+    for (int c : info.captured_stones) {
+        if (a.getPlayer() == Player::kPlayer1) {
+            if (satisfied_white.count(c)) return true; // black move captured white MUST
+        } else {
+            if (satisfied_black.count(c)) return true; // white move captured black MUST
+        }
+    }
+    return false;
+}
 
-std::vector<SeqState> findInfoSetAtMove(
-    Player target_player,
+std::vector<SeqState> sampleInfoSetAtMove(
+    int board_size,
+    int move_number,
+    const std::unordered_set<int>& must_black,
+    const std::unordered_set<int>& must_white,
+    size_t max_info_set_size,
+    int max_total_attempts = 200000)
+{
+    const int PASS = board_size * board_size;
+    std::vector<SeqState> out;
+    out.reserve(max_info_set_size);
+    std::unordered_set<GoHashKey> seen;
+
+    const int black_slots = (move_number + 1) / 2;
+    const int white_slots = (move_number) / 2;
+
+    std::mt19937 rng{std::random_device{}()};
+
+    auto verifyMustSatisfied = [&](const GoEnv& env)->bool {
+        for (int pos : must_black)
+            if (env.getGrid(pos).getPlayer() != Player::kPlayer1) return false;
+        for (int pos : must_white)
+            if (env.getGrid(pos).getPlayer() != Player::kPlayer2) return false;
+        return true;
+    };
+
+    std::vector<int> steps(max_total_attempts);
+    std::iota(steps.begin(), steps.end(), 1);
+    auto pbar = minizero::utils::tqdm::tqdm(
+        steps, "Sampling attempts: {step}/{size}");
+
+    for (int attempt : pbar) {
+        if (out.size() >= max_info_set_size) break;
+
+        GoEnv env(board_size);
+        std::vector<GoAction> seq;
+        seq.reserve(move_number);
+
+        std::unordered_set<int> pending_black = must_black;
+        std::unordered_set<int> pending_white = must_white;
+        std::unordered_set<int> satisfied_black, satisfied_white;
+
+        bool fail = false;
+
+        for (int t = 0; t < move_number && !fail; ++t) {
+            Player p = (t % 2 == 0) ? Player::kPlayer1 : Player::kPlayer2;
+            auto& pending_me    = (p == Player::kPlayer1) ? pending_black : pending_white;
+            auto& satisfied_me  = (p == Player::kPlayer1) ? satisfied_black : satisfied_white;
+            auto& satisfied_opp = (p == Player::kPlayer1) ? satisfied_white : satisfied_black;
+            const auto& opp_must_all = (p == Player::kPlayer1) ? must_white : must_black;
+
+            // place MUST first
+            bool placed = false;
+            if (!pending_me.empty()) {
+                std::vector<int> pend_list(pending_me.begin(), pending_me.end());
+                std::shuffle(pend_list.begin(), pend_list.end(), rng);
+                for (int pos : pend_list) {
+                    GoEnv test = env;
+                    GoAction a(pos, p);
+                    if (!test.act(a)) continue;
+                    if (breaksSatisfiedMust(env, test, a, satisfied_black, satisfied_white)) continue;
+
+                    env = std::move(test);
+                    seq.push_back(a);
+                    pending_me.erase(pos);
+                    satisfied_me.insert(pos);
+                    placed = true;
+                    break;
+                }
+            }
+            if (placed) continue;
+
+            // Random legal move (not overlap MUST)
+            std::vector<GoAction> legal = env.getLegalActions();
+            if (!legal.empty()) {
+                std::shuffle(legal.begin(), legal.end(), rng);
+
+                bool moved = false;
+                // Pick a move not in opponent's MUST and not capture satisfied stones
+                for (const auto& a : legal) {
+                    int id = a.getActionID();
+                    if (id == PASS) continue;
+                    if (opp_must_all.count(id)) continue;
+                    GoEnv test = env;
+                    if (!test.act(a)) continue;
+                    if (breaksSatisfiedMust(env, test, a, satisfied_black, satisfied_white)) continue;
+
+                    env = std::move(test);
+                    seq.push_back(a);
+                    moved = true;
+                    break;
+                }
+
+                // PASS
+                if (!moved) {
+                    GoAction pass(PASS, p);
+                    GoEnv test = env;
+                    if (test.act(pass)) {
+                        env = std::move(test);
+                        seq.push_back(pass);
+                    } else {
+                        fail = true;
+                    }
+                }
+            } else {
+                // No legal move => PASS
+                GoAction pass(PASS, p);
+                GoEnv test = env;
+                if (test.act(pass)) {
+                    env = std::move(test);
+                    seq.push_back(pass);
+                } else {
+                    fail = true;
+                }
+            }
+        }
+
+        if (fail) continue;
+
+        // Check MUSTs exist
+        if (!pending_black.empty() || !pending_white.empty()) continue;
+        if (!verifyMustSatisfied(env)) continue;
+
+        GoHashKey h = env.getHashKey();
+        if (seen.insert(h).second) {
+            out.push_back(SeqState{ std::move(seq), h });
+        }
+    }
+
+    return out;
+}
+
+// Ensure ground truth exists in the info set
+void ensureGroundTruthIncluded(
+    int move_number,
+    const std::vector<GoAction>& referee_actions,
+    int board_size,
+    size_t max_info_set_size,
+    std::vector<SeqState>& seqs)
+{
+    std::vector<GoAction> truth_seq(referee_actions.begin(),
+                                    referee_actions.begin() + move_number);
+
+    GoEnv env(board_size);
+    if (!rebuildEnvFromSeq(board_size, truth_seq, env)) {
+        std::cerr << "ensureGroundTruthIncluded: rebuild failed for truth_seq\n";
+        return;
+    }
+    GoHashKey truth_hash = env.getHashKey();
+
+    // check if already exists
+    bool present = false;
+    for (const auto& s : seqs) {
+        if (s.hash == truth_hash) { 
+            present = true;
+            break; 
+        }
+    }
+    if (present) return;
+
+    // if not, add it into the information set
+    SeqState gt{ std::move(truth_seq), truth_hash };
+    if (seqs.size() < max_info_set_size) {
+        seqs.push_back(std::move(gt));
+    } else {
+        static std::mt19937 rng{std::random_device{}()};
+        std::uniform_int_distribution<size_t> dist(0, seqs.size() - 1);
+        seqs[dist(rng)] = std::move(gt);
+    }
+}
+
+InfoSetsAtMove findInfoSetsAtMove(
     int move_number,
     const std::vector<GoEnv>& referee_history,
     const std::vector<GoAction>& referee_actions,
-    size_t max_info_set_size, 
-    std::vector<InfoSetSizesRow>* sizes_log)
+    size_t max_info_set_size,
+    InfoSetSizesRow* size_row = nullptr)
 {
+    InfoSetsAtMove ret; // result at target move
     if (move_number < 0 || move_number > (int)referee_actions.size()) {
         std::cerr << "Error: Invalid move_number " << move_number << "\n";
-        return {};
+        return ret;
     }
-    const int board_size = referee_history[0].getBoardSize();
+    const int N = referee_history[0].getBoardSize();
 
-    std::vector<SeqState> black_set, white_set;
+    auto events = buildMoveEvents(referee_history, referee_actions);
+
+   
+    // ---- Black perspective @ move_number ----
     {
-        GoEnv empty(board_size);
-        SeqState root{ {}, empty.getHashKey() };
-        black_set = { root };
-        white_set = { root };
+        auto [mb, mw] = computeMustSets(move_number, Player::kPlayer1, events, referee_history);
+        std::cout << "\n[Sampling attempts – Black]\n";
+        ret.black = sampleInfoSetAtMove(N, move_number, mb, mw, max_info_set_size);
+        ensureGroundTruthIncluded(move_number, referee_actions, N, max_info_set_size, ret.black);
+    }
+    // ---- White perspective @ move_number ----
+    {
+        auto [mb, mw] = computeMustSets(move_number, Player::kPlayer2, events, referee_history);
+        std::cout << "\n[Sampling attempts – White]\n";
+        ret.white = sampleInfoSetAtMove(N, move_number, mb, mw, max_info_set_size);
+        ensureGroundTruthIncluded(move_number, referee_actions, N, max_info_set_size, ret.white);
     }
 
-    std::vector<int> moves_to_process(move_number);
-    std::iota(moves_to_process.begin(), moves_to_process.end(), 1);
-
-    auto pbar = minizero::utils::tqdm::tqdm(
-        moves_to_process,
-        "Calculating: {step}/{size}"
-    );
-
-    for (int i : pbar) {
-        int k = i - 1;
-        const GoAction& real_action = referee_actions[k];
-        const int board_size = referee_history[0].getBoardSize();
-
-        GoEnv ref_before = referee_history[k];
-        GoEnv ref_after  = ref_before;
-        bool ok = ref_after.act(real_action);
-        if (!ok) { std::cerr << "CRITICAL: real action illegal\n"; break; }
-        MoveInfo true_info = analyzeMove(ref_before, ref_after, real_action);
-
-        Player mover = real_action.getPlayer();
-        if (mover == Player::kPlayer1) {
-            black_set = updateInfoSetForActor(black_set, true_info, real_action, board_size);
-            white_set = generateInfoSet(white_set, referee_history[k], real_action);
-        } else {
-            white_set = updateInfoSetForActor(white_set, true_info, real_action, board_size);
-            black_set = generateInfoSet(black_set, referee_history[k], real_action);
-        }
-
-        pruneSeqSet(black_set, max_info_set_size);
-        pruneSeqSet(white_set, max_info_set_size);
-
-        if (sizes_log) {
-            sizes_log->push_back(InfoSetSizesRow{
-                .move_index = i,
-                .black_size = black_set.size(),
-                .white_size = white_set.size()
-        });
-    }
+    if (size_row) {
+        size_row->move_index = move_number;
+        size_row->black_size = ret.black.size();
+        size_row->white_size = ret.white.size();
     }
 
-
-    return (target_player == Player::kPlayer1) ? black_set : white_set;
+    return ret;
 }
 
+
+// Display and verification
 void analyzeAndDisplayInfoSet(
     Player player,
     int move_number,
@@ -284,14 +408,18 @@ void analyzeAndDisplayInfoSet(
               << " after move #" << move_number << "...\n"
               << "=================================================================\n\n";
 
+    // Generate the information set at move
     
-    std::vector<InfoSetSizesRow> sizes_log;
-    std::vector<SeqState> seq_set = findInfoSetAtMove(
-        player, move_number, referee_history, referee_actions, max_info_set_size, &sizes_log);
+    InfoSetSizesRow size_row{};
+    auto both = findInfoSetsAtMove(
+        move_number, referee_history, referee_actions, max_info_set_size, &size_row);
+    const auto& seq_set = (player == Player::kPlayer1) ? both.black : both.white;
 
     // print the real board
     const GoEnv& truth = referee_history[move_number];
     std::cout << "\n[Real referee board after move #" << move_number << "]\n" << truth.toString() << "\n";
+    
+    std::cout << "[InfoSet perspective: " << player_name << "]\n";
 
     // pick 5 boards from the information set randomly
     {
@@ -303,50 +431,30 @@ void analyzeAndDisplayInfoSet(
         for (size_t i = 0; i < show; ++i) {
             GoEnv env(board_size);
             rebuildEnvFromSeq(board_size, seq_set[idx[i]].seq, env);
-            std::cout << "Possibility #" << (i+1) << ":\n" << env.toString() << "\n";
+            std::cout << "Possibility #" << (i + 1) << ":\n" << env.toString() << "\n";
         }
     }
 
-    // Check if the real board in the information set
-    bool present = false;
-    for (const auto& s : seq_set) {
-        GoEnv env(board_size);
-        if (!rebuildEnvFromSeq(board_size, s.seq, env)) continue;
-        if (sameStones(env, truth)) { present = true; break; }
-    }
 
-    std::cout << "\nPer-move Information Set Sizes\n";
-
+    std::cout << "\nInformation Set Size\n";
     const int W1 = 6, W2 = 12, W3 = 12;
     std::cout << std::left  << std::setw(W1) << "Move"
             << std::right << std::setw(W2) << "Black"
             << std::setw(W3) << "White" << '\n';
 
-    for (const auto& row : sizes_log) {
-        std::cout << std::left  << std::setw(W1) << row.move_index
-                << std::right << std::setw(W2) << row.black_size
-                << std::setw(W3) << row.white_size << '\n';
-    }
-
-    std::cout << "\n---------------------------\n"
-              << "Check if the referee's board is present in InfoSet\n"
-              << "---------------------------\n";
-    if (present) {
-        std::cout << "SUCCESS: Real board (by stones) is in the information set.\n";
-    } else {
-        std::cout << "WARNING: Real board (by stones) NOT found in the information set.\n";
-    }
+    std::cout << std::left  << std::setw(W1) << size_row.move_index
+            << std::right << std::setw(W2) << size_row.black_size
+            << std::setw(W3) << size_row.white_size << '\n';
 }
 
-
-
+// load SGF, build referee history, run demo
 int main() {
     SGFLoader loader;
     if (!loader.loadFromFile("../test.sgf")) {
         std::cerr << "Error: Cannot load .sgf file" << std::endl;
         return 1;
     }
-    
+
     std::cout << "Sucessfully load .sgf file; totally " << loader.getActions().size() << " moves" << std::endl;
 
     int board_size = 9;
@@ -356,33 +464,33 @@ int main() {
 
     std::vector<GoEnv> referee_history;
     std::vector<GoAction> referee_actions;
-    
+
     GoEnv current_env(board_size);
     referee_history.push_back(current_env);
 
     for (const auto& action_pair : loader.getActions()) {
         const auto& sgf_action = action_pair.first;
         if (sgf_action.size() < 2) continue;
-        
+
         Player player = (sgf_action[0] == "B") ? Player::kPlayer1 : Player::kPlayer2;
         int action_id;
         if (sgf_action[1].empty() || sgf_action[1] == "tt" || sgf_action[1] == "pass") {
-            action_id = board_size * board_size;
+            action_id = board_size * board_size; // PASS
         } else {
             action_id = SGFLoader::boardCoordinateStringToActionID(sgf_action[1], board_size);
         }
-        
+
         GoAction action(action_id, player);
         if (!current_env.act(action)) {
             std::cerr << "Invalid move: " << referee_actions.size() + 1 << std::endl;
             return 1;
         }
-        
+
         referee_actions.push_back(action);
         referee_history.push_back(current_env);
     }
 
-    int target_move = 14;
+    int target_move = 40;
     analyzeAndDisplayInfoSet(Player::kPlayer2, target_move, referee_history, referee_actions, MAX_INFO_SET_SIZE);
 
     return 0;
