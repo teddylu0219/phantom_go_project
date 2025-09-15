@@ -98,6 +98,15 @@ std::vector<MoveEvent> buildMoveEvents(
     return events;
 }
 
+int countStonesOnBoard(const GoEnv& env, Player p) {
+    const int N = env.getBoardSize();
+    int cnt = 0;
+    for (int i = 0; i < N * N; ++i) {
+        if (env.getGrid(i).getPlayer() == p) ++cnt;
+    }
+    return cnt;
+}
+
 std::pair<std::unordered_set<int>, std::unordered_set<int>> computeMustSets(
     int move_number,
     Player perspective, // who knows their own stones
@@ -119,9 +128,11 @@ std::pair<std::unordered_set<int>, std::unordered_set<int>> computeMustSets(
         const GoEnv& after  = referee_history[i + 1];
 
         if (ev.mover == MY) {
-            // my move
-            if (ev.pos != PASS) must_my.insert(ev.pos);
-            // capture opponent stones
+            // My move => Add it into my MUST
+            if (ev.pos != PASS)  {
+                must_my.insert(ev.pos);
+            }
+            // Capture opponent stones => remove opp's MUST
             for (int c : ev.captured_stones) {
                 must_opp.erase(c);
             }
@@ -146,6 +157,7 @@ std::pair<std::unordered_set<int>, std::unordered_set<int>> computeMustSets(
         }
     }
 
+    // Mapping
     std::unordered_set<int> must_black, must_white;
     if (MY == Player::kPlayer1) {
         must_black = std::move(must_my);
@@ -177,27 +189,43 @@ bool breaksSatisfiedMust(
 
 std::vector<SeqState> sampleInfoSetAtMove(
     int board_size,
-    int move_number,
     const std::unordered_set<int>& must_black,
     const std::unordered_set<int>& must_white,
     size_t max_info_set_size,
-    int max_total_attempts = 200000)
+    Player my_perspective,                 // whose perspective we're sampling
+    int target_black_count,                // final # of black stones
+    int target_white_count,                // final # of white stones
+    int max_total_attempts = 20000)
 {
     const int PASS = board_size * board_size;
     std::vector<SeqState> out;
     out.reserve(max_info_set_size);
     std::unordered_set<GoHashKey> seen;
 
-    const int black_slots = (move_number + 1) / 2;
-    const int white_slots = (move_number) / 2;
+    auto other = [](Player p){ return (p == Player::kPlayer1) ? Player::kPlayer2 : Player::kPlayer1; };
+    Player opp = other(my_perspective);
 
     std::mt19937 rng{std::random_device{}()};
 
-    auto verifyMustSatisfied = [&](const GoEnv& env)->bool {
-        for (int pos : must_black)
-            if (env.getGrid(pos).getPlayer() != Player::kPlayer1) return false;
-        for (int pos : must_white)
-            if (env.getGrid(pos).getPlayer() != Player::kPlayer2) return false;
+    // place one specific stone safely (no breaking MUST)
+    auto try_place_specific = [&](GoEnv& env,
+                                  int pos,
+                                  Player p,
+                                  std::unordered_set<int>& satisfied_black,
+                                  std::unordered_set<int>& satisfied_white,
+                                  std::vector<GoAction>& seq)->bool 
+    {
+        GoEnv test = env;
+        GoAction a(pos, p);
+        if (!test.act(a)) return false;
+        if (breaksSatisfiedMust(env, test, a, satisfied_black, satisfied_white)) return false;
+        env = std::move(test);
+        seq.push_back(a);
+        if (p == Player::kPlayer1) {
+            satisfied_black.insert(pos);
+        } else {
+            satisfied_white.insert(pos);
+        }                      
         return true;
     };
 
@@ -211,93 +239,109 @@ std::vector<SeqState> sampleInfoSetAtMove(
 
         GoEnv env(board_size);
         std::vector<GoAction> seq;
-        seq.reserve(move_number);
+        seq.reserve(128);
 
+        // MUST stones
         std::unordered_set<int> pending_black = must_black;
         std::unordered_set<int> pending_white = must_white;
         std::unordered_set<int> satisfied_black, satisfied_white;
 
         bool fail = false;
+        // Initially black turn
+        Player turn = Player::kPlayer1;
 
-        for (int t = 0; t < move_number && !fail; ++t) {
-            Player p = (t % 2 == 0) ? Player::kPlayer1 : Player::kPlayer2;
-            auto& pending_me    = (p == Player::kPlayer1) ? pending_black : pending_white;
-            auto& satisfied_me  = (p == Player::kPlayer1) ? satisfied_black : satisfied_white;
-            auto& satisfied_opp = (p == Player::kPlayer1) ? satisfied_white : satisfied_black;
-            const auto& opp_must_all = (p == Player::kPlayer1) ? must_white : must_black;
-
-            // place MUST first
+        // Step 1: place all MUST stones
+        while ((!pending_black.empty() || !pending_white.empty()) && !fail) {
+            auto& pending_me   = (turn == Player::kPlayer1) ? pending_black : pending_white;
             bool placed = false;
-            if (!pending_me.empty()) {
-                std::vector<int> pend_list(pending_me.begin(), pending_me.end());
-                std::shuffle(pend_list.begin(), pend_list.end(), rng);
-                for (int pos : pend_list) {
-                    GoEnv test = env;
-                    GoAction a(pos, p);
-                    if (!test.act(a)) continue;
-                    if (breaksSatisfiedMust(env, test, a, satisfied_black, satisfied_white)) continue;
 
-                    env = std::move(test);
-                    seq.push_back(a);
-                    pending_me.erase(pos);
-                    satisfied_me.insert(pos);
-                    placed = true;
-                    break;
+            if (!pending_me.empty()) {
+                std::vector<int> cand(pending_me.begin(), pending_me.end());
+                std::shuffle(cand.begin(), cand.end(), rng);
+                for (int pos : cand) {
+                    if (try_place_specific(env, pos, turn, satisfied_black, satisfied_white, seq)) {
+                        pending_me.erase(pos);
+                        placed = true;
+                        break;
+                    }
                 }
             }
-            if (placed) continue;
 
-            // Random legal move (not overlap MUST)
-            std::vector<GoAction> legal = env.getLegalActions();
-            if (!legal.empty()) {
+            if (!placed) {
+                // MUAT is empty => PASS
+                GoEnv test = env;
+                GoAction pass(PASS, turn);
+                if (!test.act(pass)) { fail = true; break; }
+                env = std::move(test);
+                seq.push_back(pass);
+            }
+
+            turn = other(turn);
+        }
+        if (fail) continue;
+
+        // all MUST are already placed 
+        if (!pending_black.empty() || !pending_white.empty()) continue;
+
+        // Randomly place the opponent's stones until the target number reaches
+        int cur_black = countStonesOnBoard(env, Player::kPlayer1);
+        int cur_white = countStonesOnBoard(env, Player::kPlayer2);
+
+        int need_black = std::max(0, target_black_count - cur_black);
+        int need_white = std::max(0, target_white_count - cur_white);
+
+        int need_opp   = (opp == Player::kPlayer1) ? need_black : need_white;
+        int need_self  = 0; 
+
+        int safety_steps = board_size * board_size * 4; // 防暴衝
+        while (!fail && safety_steps-- > 0 && (need_opp > 0 || need_self > 0)) {
+            if (turn == my_perspective) {
+                // PASS for my turn
+                GoEnv test = env;
+                GoAction pass(PASS, turn);
+                if (!test.act(pass)) { fail = true; break; }
+                env = std::move(test);
+                seq.push_back(pass);
+            } else {
+                // opp's turn => randomly place (do not break MUST)
+                std::vector<GoAction> legal = env.getLegalActions();
+                if (legal.empty()) { fail = true; break; }
                 std::shuffle(legal.begin(), legal.end(), rng);
 
                 bool moved = false;
-                // Pick a move not in opponent's MUST and not capture satisfied stones
                 for (const auto& a : legal) {
                     int id = a.getActionID();
                     if (id == PASS) continue;
-                    if (opp_must_all.count(id)) continue;
+                    if (a.getPlayer() != opp) continue;
+
                     GoEnv test = env;
                     if (!test.act(a)) continue;
+
                     if (breaksSatisfiedMust(env, test, a, satisfied_black, satisfied_white)) continue;
 
                     env = std::move(test);
                     seq.push_back(a);
                     moved = true;
+                    if (opp == Player::kPlayer1) {
+                        --need_black, --need_opp;
+                    } else {
+                        --need_white, --need_opp;
+                    }              
                     break;
                 }
-
-                // PASS
-                if (!moved) {
-                    GoAction pass(PASS, p);
-                    GoEnv test = env;
-                    if (test.act(pass)) {
-                        env = std::move(test);
-                        seq.push_back(pass);
-                    } else {
-                        fail = true;
-                    }
-                }
-            } else {
-                // No legal move => PASS
-                GoAction pass(PASS, p);
-                GoEnv test = env;
-                if (test.act(pass)) {
-                    env = std::move(test);
-                    seq.push_back(pass);
-                } else {
-                    fail = true;
-                }
+                if (!moved) { fail = true; break; }
             }
+            turn = other(turn);
         }
 
         if (fail) continue;
 
-        // Check MUSTs exist
-        if (!pending_black.empty() || !pending_white.empty()) continue;
-        if (!verifyMustSatisfied(env)) continue;
+        // check if reaching the target number of stones
+        int fin_black = countStonesOnBoard(env, Player::kPlayer1);
+        int fin_white = countStonesOnBoard(env, Player::kPlayer2);
+        if (fin_black != target_black_count || fin_white != target_white_count) continue;
 
+        // hash
         GoHashKey h = env.getHashKey();
         if (seen.insert(h).second) {
             out.push_back(SeqState{ std::move(seq), h });
@@ -306,6 +350,7 @@ std::vector<SeqState> sampleInfoSetAtMove(
 
     return out;
 }
+
 
 // Ensure ground truth exists in the info set
 void ensureGroundTruthIncluded(
@@ -353,7 +398,7 @@ InfoSetsAtMove findInfoSetsAtMove(
     size_t max_info_set_size,
     InfoSetSizesRow* size_row = nullptr)
 {
-    InfoSetsAtMove ret; // result at target move
+    InfoSetsAtMove ret;
     if (move_number < 0 || move_number > (int)referee_actions.size()) {
         std::cerr << "Error: Invalid move_number " << move_number << "\n";
         return ret;
@@ -362,19 +407,37 @@ InfoSetsAtMove findInfoSetsAtMove(
 
     auto events = buildMoveEvents(referee_history, referee_actions);
 
-   
-    // ---- Black perspective @ move_number ----
+    // Target number of stones
+    const GoEnv& truth = referee_history[move_number];
+    auto countStones = [&](Player p){
+        int c = 0;
+        for (int i = 0; i < N*N; ++i) {
+            if (truth.getGrid(i).getPlayer() == p) {
+                ++c;
+            }
+        }
+        return c;
+    };
+    const int target_black = countStones(Player::kPlayer1);
+    const int target_white = countStones(Player::kPlayer2);
+
     {
         auto [mb, mw] = computeMustSets(move_number, Player::kPlayer1, events, referee_history);
-        std::cout << "\n[Sampling attempts – Black]\n";
-        ret.black = sampleInfoSetAtMove(N, move_number, mb, mw, max_info_set_size);
+        std::cout << "\n[Sampling attempts: Black]\n";
+        ret.black = sampleInfoSetAtMove(
+            N, move_number, mb, mw, max_info_set_size,
+            Player::kPlayer1,
+            target_black, target_white);
         ensureGroundTruthIncluded(move_number, referee_actions, N, max_info_set_size, ret.black);
     }
-    // ---- White perspective @ move_number ----
+
     {
         auto [mb, mw] = computeMustSets(move_number, Player::kPlayer2, events, referee_history);
-        std::cout << "\n[Sampling attempts – White]\n";
-        ret.white = sampleInfoSetAtMove(N, move_number, mb, mw, max_info_set_size);
+        std::cout << "\n[Sampling attempts: White]\n";
+        ret.white = sampleInfoSetAtMove(
+            N, move_number, mb, mw, max_info_set_size,
+            Player::kPlayer2,
+            target_black, target_white);
         ensureGroundTruthIncluded(move_number, referee_actions, N, max_info_set_size, ret.white);
     }
 
@@ -460,7 +523,7 @@ int main() {
     int board_size = 9;
     minizero::config::env_board_size = board_size;
     initialize();
-    const size_t MAX_INFO_SET_SIZE = 100000;
+    const size_t MAX_INFO_SET_SIZE = 10000;
 
     std::vector<GoEnv> referee_history;
     std::vector<GoAction> referee_actions;
