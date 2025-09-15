@@ -189,6 +189,7 @@ bool breaksSatisfiedMust(
 
 std::vector<SeqState> sampleInfoSetAtMove(
     int board_size,
+    int move_number,
     const std::unordered_set<int>& must_black,
     const std::unordered_set<int>& must_white,
     size_t max_info_set_size,
@@ -268,7 +269,7 @@ std::vector<SeqState> sampleInfoSetAtMove(
             }
 
             if (!placed) {
-                // MUAT is empty => PASS
+                // MUST is empty => PASS
                 GoEnv test = env;
                 GoAction pass(PASS, turn);
                 if (!test.act(pass)) { fail = true; break; }
