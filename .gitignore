@@ -1,2 +1,9 @@
 .vscode/
 build/
+RBC.pdf
+reportPhantomGo2007.pdf
+.cache/
+.conda-env/
+.conda_cache/
+.pip_cache/
+network/__pycache__/
